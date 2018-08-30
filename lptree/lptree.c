@@ -113,13 +113,25 @@ add_child(struct lptree32 *tree, struct node *node, int idx,
 }
 
 static int
+fls(int x, int len)
+{
+	int i;
+	for (i = 0; i < len; ++i) {
+		if (x & (1 << (31 - i))) {
+			return 32 - i;		
+		}
+	}
+	return 0;
+}
+
+static int
 node_cmp(struct node *node, uint32_t key, int len)
 {
 	int rc;
 	if (len > node->len) {
 		len = node->len;
 	}
-	rc = fls(key  ^ node->key);
+	rc = fls(key ^ node->key, len);
 	if (rc == 0) {
 		rc = len;
 	} else {
@@ -136,19 +148,20 @@ node_cmp(struct node *node, uint32_t key, int len)
 }
 
 static int
-node_search(struct lptree32 *tree, struct node *node, uint32_t key)
+node_search(struct lptree32 *tree, struct node *node, uint32_t key, int len)
 {
 	int i, rc;
 	struct node *child;
-	rc = node_cmp(node, key, 32);
+	rc = node_cmp(node, key, len);
 	if (rc < node->len) {
 		return -ESRCH;
 	}
 	key <<= node->len;
+	len  -= node->len;
 	for (i = 0; i < 2; ++i) {
 		child = get_node(tree, node->children_id[i]);
 		if (child) {
-			rc = node_search(tree, child, key);
+			rc = node_search(tree, child, key, len);
 			if (rc > 0) {
 				return rc;
 			}
@@ -360,7 +373,7 @@ lptree32_init(struct lptree32 *tree, int n)
 	int i;
 	struct node *node;
 	assert(n > 32);
-	tree->nodes = malloc(n * sizeof(node));
+	tree->nodes = malloc(n * sizeof(*node));
 	tree->nr_nodes = 0;
 	assert(tree->nodes != NULL);
 	tree->root = tree->nodes + 1;
@@ -377,7 +390,7 @@ static int
 lptree32_search(struct lptree32 *tree, uint32_t key)
 {
 	int rc;
-	rc = node_search(tree, tree->root, key);
+	rc = node_search(tree, tree->root, key, 32);
 	return rc;
 }
 
@@ -538,7 +551,7 @@ main(int argc, char **argv)
 	//return 0;
 
 	idx = 1;
-	lptree32_init(&tree, 2 * 16384);
+	lptree32_init(&tree, 10000);
 	printf("sizeof(node)=%lu\n", sizeof(struct node));
 //	assert(0);
 

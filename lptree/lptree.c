@@ -112,6 +112,7 @@ add_child(struct lptree32 *tree, struct node *node, int idx,
 	node->children_id[idx] = get_node_id(tree, child);
 }
 
+#ifdef __linux__
 static int
 fls(int x, int len)
 {
@@ -123,6 +124,7 @@ fls(int x, int len)
 	}
 	return 0;
 }
+#endif
 
 static int
 node_cmp(struct node *node, uint32_t key, int len)
@@ -147,11 +149,14 @@ node_cmp(struct node *node, uint32_t key, int len)
 	return rc;
 }
 
+static int nr_node_search;
+
 static int
 node_search(struct lptree32 *tree, struct node *node, uint32_t key, int len)
 {
 	int i, rc;
 	struct node *child;
+	nr_node_search++;
 	rc = node_cmp(node, key, len);
 	if (rc < node->len) {
 		return -ESRCH;
@@ -523,8 +528,9 @@ search_file(struct lptree32 *tree, const char *filename)
 	}
 	gettimeofday(&tv1, NULL);
 	free(keys);
-	printf("found=%d(%d), dt=%luus\n", found, nr_keys,
-		1000000 * (tv1.tv_sec - tv0.tv_sec) + tv1.tv_usec - tv0.tv_usec);
+	printf("found=%d(%d), dt=%luus, calls=%d\n", found, nr_keys,
+		1000000 * (tv1.tv_sec - tv0.tv_sec) + tv1.tv_usec - tv0.tv_usec,
+		nr_node_search);
 }
 
 static void
@@ -552,7 +558,6 @@ main(int argc, char **argv)
 
 	idx = 1;
 	lptree32_init(&tree, 10000);
-	printf("sizeof(node)=%lu\n", sizeof(struct node));
 //	assert(0);
 
 	while ((opt = getopt(argc, argv, "a:A:d:D:s:S:p")) != -1) {

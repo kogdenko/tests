@@ -12,14 +12,26 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+struct rule;
+
+LIST_HEAD(rule_head, rule);
+
+struct rule {
+	LIST_ENTRY(rule) list;
+	struct node *node;
+	uint32_t key;
+	uint32_t k;
+	int depth;
+	int d;
+};
+
 struct node {
 	union {
 		struct {
-			uint32_t key;
-			uint8_t len;
-			uint16_t data;
-			uint16_t parent_id;
-			uint16_t children_id[2];
+			uint32_t children[256];
+			struct rule_head rules;
+			struct rule *rule;
+			struct node *parent;
 		};
 		LIST_ENTRY(node) list;
 	};
@@ -27,399 +39,466 @@ struct node {
 
 LIST_HEAD(node_head, node);
 
-struct lptree32 {
+struct lptree {
+	struct rule *rules;
 	struct node *nodes;
 	struct node *root;
 	int nr_nodes;
-	struct node_head free_head;
+	int nr_rules;
+	struct node_head free_nodes;
+	struct rule_head free_rules;
 };
 
-static int node_add(struct lptree32 *tree, struct node *node,
-                    uint32_t key, int len, int cmp,
-                    uint16_t data);
+#define RULE_FLAG 0x80000000
 
 static int
-get_node_id(struct lptree32 *tree, struct node *node)
+get_node_id(struct lptree *tree, struct node *node)
 {
 	return node - tree->nodes;
 }
 
-static struct node *
-get_node(struct lptree32 *tree, uint16_t node_id)
+static int
+get_rule_id(struct lptree *tree, struct rule *rule)
 {
-	if (node_id == 0) {
-		return NULL;
-	} else {
-		return tree->nodes + node_id;
-	}
+	uint32_t idx;
+	idx = rule - tree->rules;
+	return idx | RULE_FLAG;
 }
 
 static struct node *
-new_node(struct lptree32 *tree)
+get_node(struct lptree *tree, uint32_t node_id)
+{
+	assert(node_id);
+	return tree->nodes + node_id;
+}
+
+static struct rule *
+get_rule(struct lptree *tree, uint32_t rule_id)
+{
+	uint32_t idx;
+	assert(rule_id & RULE_FLAG);
+	idx = (rule_id & (~RULE_FLAG));
+	return tree->rules + idx;
+}
+
+static struct node *
+alloc_node(struct lptree *tree, struct node *parent)
 {
 	struct node *node;
-	assert(!LIST_EMPTY(&tree->free_head));	
-	node = LIST_FIRST(&tree->free_head);
+	assert(!LIST_EMPTY(&tree->free_nodes));	
+	node = LIST_FIRST(&tree->free_nodes);
 	LIST_REMOVE(node, list);
 	memset(node, 0, sizeof(*node));
+	LIST_INIT(&node->rules);
+	node->parent = parent;
 	tree->nr_nodes++;
 	return node;
 }
 
-static void
-free_node(struct lptree32 *tree, struct node *node)
+void
+free_node(struct lptree *tree, struct node *node)
 {
-	LIST_INSERT_HEAD(&tree->free_head, node, list);
+	assert(LIST_EMPTY(&node->rules));
+	LIST_INSERT_HEAD(&tree->free_nodes, node, list);
 	tree->nr_nodes--;
 }
 
-static struct node *
-get_child(struct lptree32 *tree, struct node *node, int idx)
+static void
+free_rule(struct lptree *tree, struct rule *rule)
 {
-	int child_id;
-	struct node *child;
-	child_id = node->children_id[idx];
-	if (child_id == 0) {
+	LIST_INSERT_HEAD(&tree->free_rules, rule, list);
+	tree->nr_rules--;
+}
+
+static void *
+to_erule(struct rule *irule)
+{
+	if (irule == NULL) {
 		return NULL;
-	} else {
-		child = tree->nodes + child_id;
-		assert(tree->nodes + child->parent_id == node);
-		return child;
 	}
+	return irule + 1;
 }
 
-static void
-set_key(struct node *node, uint32_t key, int len)
+static struct rule *
+to_irule(void *erule)
 {
-	uint32_t mask;
-	mask = 0xffffffff;
-	mask <<= (32 - len);
-	node->key = key & mask;
-	node->len = len;
-}
-
-static void
-add_child(struct lptree32 *tree, struct node *node, int idx,
-          uint32_t key, int len, uint16_t data)
-{
-	struct node *child;
-	assert(idx < 2);
-	assert(node->children_id[idx] == 0);
-	child = new_node(tree);
-	child->parent_id = get_node_id(tree, node);
-	set_key(child, key, len);
-	child->data = data;
-	node->children_id[idx] = get_node_id(tree, child);
-}
-
-#ifdef __linux__
-static int
-fls(int x, int len)
-{
-	int i;
-	for (i = 0; i < len; ++i) {
-		if (x & (1 << (31 - i))) {
-			return 32 - i;		
-		}
+	if (erule == NULL) {
+		return NULL;
 	}
-	return 0;
+	return (struct rule *)(((uint8_t *)erule) - sizeof(struct rule));
 }
-#endif
 
 static int
-node_cmp(struct node *node, uint32_t key, int len)
+get_or_create_rule(struct lptree *tree, struct rule **prule,
+                   struct node *node, int create,
+                   uint32_t key, int depth)
 {
 	int rc;
-	if (len > node->len) {
-		len = node->len;
-	}
-	rc = fls(key ^ node->key, len);
-	if (rc == 0) {
-		rc = len;
-	} else {
-		assert(rc > 0 && rc <= 32);
-		rc = 32 - rc;
-		if (rc > len) {
-			rc = len;
-		}
-	}
-	assert(rc >= 0 && rc <= len);
-//	printf("CMP: %x^%x=%x rc=%d, %d\n",
-//		key, node->key, key ^ node->key, rc, len);
-	return rc;
-}
-
-static int nr_node_search;
-
-static int
-node_search(struct lptree32 *tree, struct node *node, uint32_t key, int len)
-{
-	int i, rc;
-	struct node *child;
-	nr_node_search++;
-	rc = node_cmp(node, key, len);
-	if (rc < node->len) {
-		return -ESRCH;
-	}
-	key <<= node->len;
-	len  -= node->len;
-	for (i = 0; i < 2; ++i) {
-		child = get_node(tree, node->children_id[i]);
-		if (child) {
-			rc = node_search(tree, child, key, len);
-			if (rc > 0) {
-				return rc;
+	struct rule *rule, *after;
+	after = NULL;
+	rc = 0;
+	LIST_FOREACH(rule, &node->rules, list) {
+		if (rule->depth == depth) {
+			if (rule->key == key) {
+				rc = -EEXIST;
+				break;
 			}
-		}
-	}
-	return node->data;
-}
-
-static void
-node_del(struct lptree32 *tree, struct node *node)
-{
-	int i, tmp, child_id, nr_children;
-	struct node *x, *parent, *child;
-	nr_children = 0;
-	if (node->len == 0) {
-		// Root
-		node->data = 0;
-		return;
-	}
-	child = NULL;
-	for (i = 0; i < 2; ++i) {
-		x = get_node(tree, node->children_id[i]);
-		if (x != NULL) {
-			child = x;
-			nr_children++;
-		}
-	}
-	node->data = 0;
-	if (nr_children == 2) {
-		return;
-	}
-	parent = get_node(tree, node->parent_id);
-	assert(parent);
-	if (nr_children == 0) {
-		child_id = 0;
-	} else {
-		child_id = get_node_id(tree, child);
-		// Merge into child
-		assert(nr_children == 1);
-		assert(child != NULL);
-		child->key >>= node->len;
-		child->key  |= node->key;
-		child->len  += node->len;
-		child->parent_id = node->parent_id;
-	}
-	for (i = 0; i < 2; ++i) {	
-		tmp = parent->children_id[i];
-		if (get_node(tree, tmp) == node) {
-			parent->children_id[i] = child_id;
+		} else if (depth < rule->depth) {
 			break;
-		}
-	}
-	free_node(tree, node);
-	if (parent->data == 0) {
-		node_del(tree, parent);
-	}
-}
-
-static struct node *
-node_find(struct lptree32 *tree, struct node *node, uint32_t key, int len)
-{
-	int i, rc;
-	struct node *x, *child;
-	if (node->len > len) {
-		return NULL;
-	}
-	rc = node_cmp(node, key, len);
-	if (rc < node->len) {
-		return NULL;
-	}
-	if (node->len == len) {
-		return node;
-	}
-	key <<= node->len;
-	len  -= node->len;
-	for (i = 0; i < 2; ++i) {
-		child = get_node(tree, node->children_id[i]);
-		if (child != NULL) {
-			x = node_find(tree, child, key, len);
-			if (x != NULL) {
-				return x;
-			}
-		}
-	}
-	return NULL;
-}
-
-static int
-node_addA(struct lptree32 *tree, struct node *node,
-          uint32_t key, int len,
-          uint16_t data)
-{
-	int i, rc, ccmp, empty;
-	struct node *child;
-	empty = -1;
-	for (i = 0; i < 2; ++i) {
-		child = get_child(tree, node, i);
-		if (child == NULL) {
-			empty = i;
 		} else {
-			ccmp = node_cmp(child, key, len);
-			if (ccmp) {
-				rc = node_add(tree, child, key, len, ccmp, data);
-				return rc;
-			}
+			after = rule;
 		}
 	}
-	assert(empty != -1);
-	add_child(tree, node, empty, key, len, data);
-	return data;
+	if (rc == 0 && create) {
+		assert(!LIST_EMPTY(&tree->free_rules));	
+		rule = LIST_FIRST(&tree->free_rules);
+		LIST_REMOVE(rule, list);
+		rule->key = key;
+		rule->depth = depth;
+		rule->node = node;
+		tree->nr_rules++;
+		if (after == NULL) {
+			LIST_INSERT_HEAD(&node->rules, rule, list);
+		} else {
+			LIST_INSERT_AFTER(after, rule, list);
+		}
+	}
+	*prule = rule;
+	return rc;
 }
 
 static int
-node_add(struct lptree32 *tree, struct node *node,
-          uint32_t key, int len, int cmp,
-          uint16_t data)
+lptree_init(struct lptree *tree, int n, int rule_size)
 {
-	int i, rc;
-	uint16_t x_id;
-	struct node *x, *y, *child, *parent;
-	assert(len > 0);
-	assert(cmp <= node->len);
-	assert(cmp <= len);
-	assert(cmp > 0 || (cmp == 0 && node->len == 0));
-	if (cmp == node->len) {
-		if (len > node->len) {
-			key <<= cmp;
-			len  -= cmp;
-			rc = node_addA(tree, node, key, len, data);
-			return rc;
-		} else if (len == node->len) {
-			if (node->data == 0) {
-				node->data = data;
-			}
-			return node->data;
+	int i;
+	struct node *node;
+	struct rule *rule;
+	assert(n);
+	LIST_INIT(&tree->free_nodes);
+	LIST_INIT(&tree->free_rules);
+	tree->nr_nodes = 0;
+	tree->nr_rules = 0;
+	tree->nodes = malloc(n * sizeof(*node));
+	assert(tree->nodes != NULL);
+	tree->rules = malloc(n * (sizeof(*rule) + rule_size));
+	assert(tree->rules != NULL);
+	for (i = 0; i < n; ++i) {
+		node = tree->nodes + i;
+		rule = tree->rules + i;
+		LIST_INSERT_HEAD(&tree->free_nodes, node, list);
+		LIST_INSERT_HEAD(&tree->free_rules, rule, list);
+	}
+	tree->root = alloc_node(tree, NULL);
+	return 0;
+}
+
+//static uint32_t
+
+
+static int
+lptree_search(struct lptree *tree, void **perule, uint32_t key)
+{
+	int i;
+	uint32_t k, id;
+	struct node *node;
+	struct rule *rule;
+	node = tree->root;
+	for (i = 0; i < 4; ++i) {
+		k = (key >> ((3 - i) << 3)) & 0x000000FF;
+		id = node->children[k];
+		if (id == 0) {
+			break;
+		} else if (id & RULE_FLAG) {
+			rule = get_rule(tree, id);
+			goto found;
+		} else {
+			node = get_node(tree, id);
 		}
 	}
-	x = new_node(tree);
-	x_id = get_node_id(tree, x);
-	set_key(x, node->key, cmp);
-	x->parent_id = node->parent_id;
-	x->children_id[0] = get_node_id(tree, node);
-	assert(node->parent_id != 0);
-	parent = get_node(tree, node->parent_id);
-	for (i = 0; i < 2; ++i) {
-		child = get_node(tree, parent->children_id[i]);
-		if (child == node) {
-			parent->children_id[i] = x_id;
+	if (node->rule != NULL) {
+		rule = node->rule;
+		goto found;
+	}
+	return -ESRCH;
+found:
+	if (perule != NULL) {
+		*perule = to_erule(rule);
+	}
+	return 0;
+}
+
+static struct node *
+set_node(struct lptree *tree, struct node *parent, int idx)
+{
+	uint32_t id;
+	struct node *node;
+	struct rule *rule;
+	id = parent->children[idx];
+	if (id & RULE_FLAG) {
+		rule = get_rule(tree, id);
+		node = alloc_node(tree, parent);
+		node->rule = rule;
+	} else {
+		if (id == 0) {
+			node = alloc_node(tree, parent);
+		} else {
+			node = get_node(tree, id);
+		}
+	}
+	parent->children[idx] = get_node_id(tree, node);
+	return node;
+}
+
+static void
+unset_node(struct lptree *tree, struct node *node)
+{
+	int i;
+	uint32_t node_id, id;
+	struct node *parent;
+	parent = node->parent;
+	node_id = get_node_id(tree, node);
+	for (i = 0; i < 256; ++i) {
+		if (parent->children[i] == node_id) {
+			if (node->rule != NULL) {
+				id = get_rule_id(tree, node->rule);
+			} else {
+				id = 0;
+			}
+			parent->children[i] = id;
 			break;
 		}
 	}
-	assert(i < 2);
-	node->key <<= cmp;
-	node->len  -= cmp;
-	node->parent_id = x_id;
-	if (len == cmp) {
-		x->data = data;
-		return data;
-	}
-	y = new_node(tree);
-	set_key(y, key << cmp, len - cmp);
-	y->parent_id = x_id;
-	y->data = data;
-	x->children_id[1] = get_node_id(tree, y);
-	return data;
-}
-
-static const char *
-ktoa(uint32_t key, int len)
-{
-	int i, bit;
-	static char buf[33];
-	assert(len <= 32);
-	for (i = 0; i < len; ++i) {
-		bit = key & (1 << (31 - i));
-		buf[i] = bit ? '1' : '0';
-	}
-	buf[len] = '\0';
-	return buf;
 }
 
 static void
-lptree32_node_print(struct lptree32 *tree, struct node *node, int spaces)
+set_rule(struct lptree *tree, struct rule *new)
 {
-	int i;
-	uint16_t child_id;
-	struct node *child;
-	printf("%*s%s%s\n",
-		spaces, "", ktoa(node->key, node->len),
-		node->data ? "*" : "");
-	for (i = 0; i < 2; ++i) {
-		child_id = node->children_id[i];
-		if (child_id) {
-			child = get_node(tree, child_id);
-			lptree32_node_print(tree, child, spaces + node->len);
+	int i, n;
+	uint32_t *pid, id, rule_id;
+	struct node *node;
+	struct rule *rule;
+	rule_id = get_rule_id(tree, new);
+	n = 1 << (8 - new->d);
+	assert(new->k + n <= 256);
+	for (i = 0; i < n; ++i) {
+		pid = new->node->children + new->k + i;
+		id = *pid;
+		if (id & RULE_FLAG) {
+			rule = get_rule(tree, id);
+			if (new->depth > rule->depth) {
+				*pid = rule_id;
+			}
+		} else if (id == 0) {
+			*pid = rule_id;
+		} else {
+			node = get_node(tree, id);
+			rule = node->rule;
+			if (rule == NULL || new->depth > rule->depth) {
+				node->rule = new;
+			}
 		}
 	}
 }
 
 static void
-lptree32_print(struct lptree32 *tree)
-{
-	lptree32_node_print(tree, tree->root, 0);
-}
-
-static int
-lptree32_init(struct lptree32 *tree, int n)
+unset_rule(struct lptree *tree, struct node *node, struct rule *rule)
 {
 	int i;
-	struct node *node;
-	assert(n > 32);
-	tree->nodes = malloc(n * sizeof(*node));
-	tree->nr_nodes = 0;
-	assert(tree->nodes != NULL);
-	tree->root = tree->nodes + 1;
-	memset(tree->root, 0, sizeof(*tree->root));
-	LIST_INIT(&tree->free_head);
-	for (i = 2; i < n; ++i) {
-		node = tree->nodes + i;
-		LIST_INSERT_HEAD(&tree->free_head, node, list);
+	uint32_t rule_id, id;
+	struct node *child;
+	rule_id = get_rule_id(tree, rule);
+	for (i = 0; i < 256; ++i) {
+		id = node->children[i];
+		if (id & RULE_FLAG) {
+			if (id == rule_id) {
+				node->children[i] = 0;
+			}
+		} else if (id) {
+			child = get_node(tree, id);
+			if (child->rule == rule) {
+				child->rule = NULL;
+			}
+		}
 	}
-	return 0;
 }
 
 static int
-lptree32_search(struct lptree32 *tree, uint32_t key)
+node_empty(struct node *node)
 {
-	int rc;
-	rc = node_search(tree, tree->root, key, 32);
-	return rc;
+	uint32_t id;
+	int i;
+	if (node->parent == NULL) {
+		return 0;
+	}
+	if (!LIST_EMPTY(&node->rules)) {
+		return 0;
+	}
+	for (i = 0; i < 256; ++i) {
+		id = node->children[i];
+		assert((id & RULE_FLAG) == 0);
+		if (id) {
+			return 0;
+		}
+	}
+	return 1;
 }
 
-static int
-lptree32_del(struct lptree32 *tree, uint32_t key, int len)
+static void
+del_node(struct lptree *tree, struct node *node)
+{
+	int i;
+	uint32_t id;
+	struct node *parent, *child;
+	struct rule *rule;
+	parent = node->parent;
+	unset_node(tree, node);
+	for (i = 0; i < 256; ++i) {
+		id = node->children[i];
+		if (id != 0 && (id & RULE_FLAG) == 0) {
+			child = get_node(tree, id);
+			del_node(tree, child);
+		}
+	}
+	while (!LIST_EMPTY(&node->rules)) {
+		rule = LIST_FIRST(&node->rules);
+		LIST_REMOVE(rule, list);
+		free_rule(tree, rule);
+	}
+	if (parent == NULL) {
+		// This is root
+		memset(node->children, 0, sizeof(node->children));
+	} else {
+		free_node(tree, node);
+		if (node_empty(parent)) {
+			del_node(tree, parent);
+		}
+	}
+}
+
+static void
+lptree_del(struct lptree *tree, void *erule)
 {
 	struct node *node;
-	node = node_find(tree, tree->root, key, len);
-	if (node == NULL) {
-		return -ESRCH;
+	struct rule *rule, *cur;
+	rule = to_irule(erule);
+	LIST_REMOVE(rule, list);
+	node = rule->node;
+	unset_rule(tree, node, rule);
+	LIST_FOREACH(cur, &node->rules, list) {
+		if (cur->depth < rule->depth) {
+			set_rule(tree, cur);
+		} else {
+			break;
+		}
 	}
-	node_del(tree, node);
-	return 0;
+	free_rule(tree, rule);
+	if (node_empty(node)) {
+		del_node(tree, node);
+	}
 }
 
 static int
-lptree32_add(struct lptree32 *tree, uint32_t key, int len, uint16_t data)
+create_dryrun(struct lptree *tree)
 {
-	int rc;
-	assert(data != 0);
-	rc = node_add(tree, tree->root, key, len, 0, data);
-	return rc;
+	int n;
+	struct node *node;
+	if (LIST_EMPTY(&tree->free_rules)) {
+		return -ENOMEM;
+	}
+	n = 0;
+	LIST_FOREACH(node, &tree->free_nodes, list) {
+		++n;
+		if (n == 4) {
+			return 0;
+		}
+	}
+	return -ENOMEM;
 }
 
+static int
+lptree_get_or_add(struct lptree *tree, void **perule,
+                    int create, uint32_t key, int depth)
+{
+	int i, d, rc;
+	uint32_t k, m;
+	struct node *node;
+	struct rule *rule;
+	assert(depth > 0);
+	assert(depth <= 32);
+	if (create) {
+		rc = create_dryrun(tree);
+		if (rc) {
+			return rc;
+		}
+	}
+	node = tree->root;
+	for (i = 0; i < 4; ++i) {
+		k = (key >> ((3 - i) << 3)) & 0x000000FF;
+		d = depth - (i << 3);
+		assert(d);
+		assert(k < 256);
+		if (d > 8) {
+			node = set_node(tree, node, k);
+		} else {
+			m = (0xff << (8 - d));
+			k &= m;
+			break;
+		}
+	}
+	rc = get_or_create_rule(tree, &rule, node, create, key, depth);
+	if (perule != NULL) {
+		*perule = to_erule(rule);
+	}
+	if (create == 0) {
+		switch (-rc) {
+		case EEXIST:
+			return 0;
+		case 0:
+			return -ESRCH;
+		default:
+			return rc;
+		}
+	} else {
+		if (rc) {
+			return rc;
+		}
+		rule->k = k;
+		rule->d = d;
+		set_rule(tree, rule);
+		return 0;
+	}
+}
+
+int
+lptree_get(struct lptree *tree, void **perule,
+             uint32_t key, int depth)
+{
+	return lptree_get_or_add(tree, perule, 0, key, depth);
+}
+
+int
+lptree_add(struct lptree *tree, void **perule,
+             uint32_t key, int depth)
+{
+	return lptree_get_or_add(tree, perule, 1, key, depth);
+}
+
+uint32_t
+lptree_rule_key(void *erule)
+{
+	struct rule *rule;
+	rule = to_irule(erule);
+	return rule->key;
+}
+
+int
+lptree_rule_depth(void *erule)
+{
+	struct rule *rule;
+	rule = to_irule(erule);
+	return rule->depth;
+}
+//===========================================================
 static int
 parse_net(char *s, struct in_addr *in)
 {
@@ -449,10 +528,11 @@ parse_net(char *s, struct in_addr *in)
 }
 
 static void
-read_file(struct lptree32 *tree, const char *filename, int action)
+read_file(struct lptree *tree, const char *filename, int action)
 {
 	char buf[256];
 	char *s;
+	void *rule;
 	int rc, line;
 	struct in_addr in;
 	FILE *file;
@@ -471,27 +551,30 @@ read_file(struct lptree32 *tree, const char *filename, int action)
 			continue;
 		}
 		if (action) {
-			rc = lptree32_add(tree, ntohl(in.s_addr), rc, line);
-			if (rc != line) {
-				fprintf(stderr, "add return %d at '%s':%d\n",
-					rc, filename, line);
+			rc = lptree_add(tree, NULL, ntohl(in.s_addr), rc);
+			if (rc != 0) {
+				fprintf(stderr, "add failed at '%s':%d (%s)\n",
+					filename, line, strerror(-rc));
 			}
 		} else {
-			rc = lptree32_del(tree, ntohl(in.s_addr), rc);
+			rc = lptree_get(tree, &rule, ntohl(in.s_addr), rc);
 			if (rc < 0) {
 				fprintf(stderr, "del failed at '%s':%d\n",
 					filename, line);
+				continue;
 			}
+			lptree_del(tree, rule);
 		}
 	}
 	fclose(file);
 }
 
 static void
-search_file(struct lptree32 *tree, const char *filename)
+search_file(struct lptree *tree, const char *filename)
 {
 	char buf[256];
 	char *s;
+	void *rule;
 	int i, rc, line, nr_keys, found;
 	struct in_addr in;
 	struct timeval tv0, tv1;
@@ -522,15 +605,14 @@ search_file(struct lptree32 *tree, const char *filename)
 	fclose(file);
 	gettimeofday(&tv0, NULL);
 	for (i = 0; i < nr_keys; ++i) {
-		if (lptree32_search(tree, keys[i]) > 0) {
+		if (lptree_search(tree, &rule, keys[i]) == 0) {
 			found++;
 		}
 	}
 	gettimeofday(&tv1, NULL);
 	free(keys);
-	printf("found=%d(%d), dt=%luus, calls=%d\n", found, nr_keys,
-		1000000 * (tv1.tv_sec - tv0.tv_sec) + tv1.tv_usec - tv0.tv_usec,
-		nr_node_search);
+	printf("found=%d(%d), dt=%luus\n", found, nr_keys,
+		1000000 * (tv1.tv_sec - tv0.tv_sec) + tv1.tv_usec - tv0.tv_usec);
 }
 
 static void
@@ -544,9 +626,9 @@ int
 main(int argc, char **argv)
 {
 	int rc, len, opt, idx;
+	void *rule;
 	struct in_addr in;
-	struct lptree32 tree;
-
+	struct lptree tree;
 	//int x, y, z;
 	//x = strtoul(argv[1], NULL, 10);
 	//y = strtoul(argv[2], NULL, 10);
@@ -555,11 +637,9 @@ main(int argc, char **argv)
 	//return 0;
 	//printf("%d\n", fls(strtoul(argv[1], NULL, 10)));
 	//return 0;
-
 	idx = 1;
-	lptree32_init(&tree, 10000);
+	lptree_init(&tree, 10000, 0);
 //	assert(0);
-
 	while ((opt = getopt(argc, argv, "a:A:d:D:s:S:p")) != -1) {
 		switch (opt) {
 		case 'a':
@@ -567,7 +647,7 @@ main(int argc, char **argv)
 			if (len == -1) {
 				invalid_arg(opt, optarg);
 			}
-			rc = lptree32_add(&tree, ntohl(in.s_addr), len, idx);
+			rc = lptree_add(&tree, &rule, ntohl(in.s_addr), len);
 			idx++;
 			printf("Add: %s/%d (%d)\n", inet_ntoa(in), len, rc);
 			break;
@@ -579,8 +659,9 @@ main(int argc, char **argv)
 			if (len == -1) {
 				invalid_arg(opt, optarg);
 			}
-			rc = lptree32_del(&tree, ntohl(in.s_addr), len);
+			rc = lptree_get(&tree, &rule, ntohl(in.s_addr), len);
 			printf("Remove: %s/%d (%d)\n", inet_ntoa(in), len, rc);
+			lptree_del(&tree, rule);
 			break;
 		case 'D':
 			read_file(&tree, optarg, 0);
@@ -590,15 +671,23 @@ main(int argc, char **argv)
 			if (rc != 1) {
 				invalid_arg(opt, optarg);
 			}
-			rc = lptree32_search(&tree, ntohl(in.s_addr));
-			printf("Search: %d\n", rc);
+			rc = lptree_search(&tree, &rule, ntohl(in.s_addr));
+			printf("Search: %d", rc);
+			if (rc == 0) {
+				in.s_addr = htonl(lptree_rule_key(rule));
+				printf(": %s/%d", inet_ntoa(in),
+					lptree_rule_depth(rule));
+			} else {
+				printf(" (%s)", strerror(-rc));
+			}
+			printf("\n");
 			break;
 		case 'S':
 			search_file(&tree, optarg);
 			break;
-		case 'p':
-			lptree32_print(&tree);
-			break;
+//		case 'p':
+//			lptree_print(&tree);
+//			break;
 		}
 	}
 

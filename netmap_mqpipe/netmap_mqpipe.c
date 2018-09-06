@@ -109,8 +109,8 @@ main(int argc, char **argv)
 	}
 	printf("nm_open('%s'), nr_rx_rings=%d, nr_tx_rings=%d\n",
 		nmr.nr_name,
-		nmr.nr_rx_rings,
-		nmr.nr_tx_rings);
+		nmd->req.nr_rx_rings,
+		nmd->req.nr_tx_rings);
 	if (txorrx) {
 		tx(nmd);
 	} else {

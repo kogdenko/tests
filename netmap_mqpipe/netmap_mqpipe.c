@@ -68,14 +68,13 @@ main(int argc, char **argv)
 	n = 1;
 	use_old = 0;
 	memset(&nmr, 0, sizeof(nmr));
-	strcpy(nmr.nr_name, "a}0");
-	while ((opt = getopt(argc, argv, "tmn:i:0")) != -1) {
+	while ((opt = getopt(argc, argv, "tI:n:i:0")) != -1) {
 		switch (opt) {
 		case 't':
 			txorrx = 1;
 			break;
-		case 'm':
-			strcpy(nmr.nr_name, "a{0");
+		case 'I':
+			strcpy(nmr.nr_name, optarg);
 			break;
 		case 'n':
 			n = strtoul(optarg, NULL, 10);
@@ -104,8 +103,14 @@ main(int argc, char **argv)
 	}
 	snprintf(ifname, sizeof(ifname), "netmap:%s", nmr.nr_name);
 	nmd = nm_open(ifname, &nmr, flags, NULL);
-	assert(nmd);
-	printf("nm_open('%s')\n", nmr.nr_name);
+	if (nmd == NULL) {
+		printf("nm_open('%s') failed\n", ifname);
+		return 1;
+	}
+	printf("nm_open('%s'), nr_rx_rings=%d, nr_tx_rings=%d\n",
+		nmr.nr_name,
+		nmr.nr_rx_rings,
+		nmr.nr_tx_rings);
 	if (txorrx) {
 		tx(nmd);
 	} else {
